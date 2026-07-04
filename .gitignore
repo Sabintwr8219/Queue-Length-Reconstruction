@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+
+data/raw_data/
+output/
+
+*.fzp
+*.lsa
+*.pt
+*.pth
+*.joblib
+*.pkl
+*.zip
+
