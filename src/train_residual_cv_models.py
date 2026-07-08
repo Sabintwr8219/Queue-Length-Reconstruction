@@ -137,12 +137,29 @@ CLIP_QUEUE_PREDICTIONS_TO_NONNEGATIVE = True
 # Constraint-aware GRU/LSTM training. The supervised target remains the residual
 # error, but the loss also evaluates the implied queue length in feet:
 #     q_pred = q_baseline_fixed_ft + residual_pred
+#
+# These values are adopted from the residual sequence diagnostic lambda sweep.
+# Selection was based on validation performance and visual behavior:
+#     LAMBDA_ZERO_QUEUE_MATCH = 0.40
+#     LAMBDA_RESIDUAL_DQ      = 0.12
+#     LAMBDA_RESIDUAL_D2Q     = 0.35
 USE_PHYSICAL_CONSTRAINT_LOSS = True
+USE_SUPERVISED_DYNAMICS_LOSS = True
 QUEUE_CONSTRAINT_SCALE_FT = 100.0
 LAMBDA_NONNEGATIVE_QUEUE = 0.10
-LAMBDA_SUDDEN_DROP = 0.05
+LAMBDA_SUDDEN_DROP = 0.03
 LAMBDA_CURVATURE = 0.01
-MAX_QUEUE_DROP_PER_STEP_FT = 15.0
+LAMBDA_DQ_MATCH = 0.55
+LAMBDA_D2Q_MATCH = 0.18
+LAMBDA_WINDOW_PEAK_MATCH = 0.30
+LAMBDA_WINDOW_MEAN_MATCH = 0.12
+LAMBDA_ZERO_QUEUE_MATCH = 0.40
+LAMBDA_RESIDUAL_DQ = 0.12
+LAMBDA_RESIDUAL_D2Q = 0.35
+MAX_QUEUE_DROP_PER_STEP_FT = 25.0
+ZERO_QUEUE_TOL_FT = 15.0
+RESIDUAL_CONSTRAINT_SCALE_FT = 75.0
+
 
 
 # =============================================================================
@@ -529,18 +546,19 @@ def predict_xgb(
 if TORCH_AVAILABLE:
 
     class SequenceWindowDataset(Dataset):
-        def __init__(self, windows: list[tuple[np.ndarray, np.ndarray, np.ndarray]]):
+        def __init__(self, windows: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]):
             self.windows = windows
 
         def __len__(self):
             return len(self.windows)
 
         def __getitem__(self, idx):
-            x, y, baseline = self.windows[idx]
+            x, y, baseline, q_true = self.windows[idx]
             return (
                 torch.tensor(x, dtype=torch.float32),
                 torch.tensor(y, dtype=torch.float32),
                 torch.tensor(baseline, dtype=torch.float32),
+                torch.tensor(q_true, dtype=torch.float32),
             )
 
 
@@ -586,10 +604,11 @@ def build_windows(
     feature_matrix: np.ndarray,
     y_scaled: np.ndarray,
     baseline_ft: np.ndarray,
+    q_true_ft: np.ndarray,
     run_ids: list[int],
     sequence_len: int,
     stride: int,
-) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     windows = []
     work = df.reset_index(drop=True)
     work = work[work["run_id"].isin(run_ids)].copy()
@@ -604,9 +623,10 @@ def build_windows(
         X_group = feature_matrix[idx]
         y_group = y_scaled[idx]
         base_group = baseline_ft[idx]
+        q_true_group = q_true_ft[idx]
 
         if len(idx) <= sequence_len:
-            windows.append((X_group, y_group, base_group))
+            windows.append((X_group, y_group, base_group, q_true_group))
             continue
 
         starts = list(range(0, len(idx) - sequence_len + 1, stride))
@@ -615,7 +635,7 @@ def build_windows(
 
         for s in starts:
             e = s + sequence_len
-            windows.append((X_group[s:e], y_group[s:e], base_group[s:e]))
+            windows.append((X_group[s:e], y_group[s:e], base_group[s:e], q_true_group[s:e]))
 
     return windows
 
@@ -655,6 +675,105 @@ def physical_queue_constraint_loss(
     )
 
 
+def supervised_queue_dynamics_loss(
+    pred_scaled,
+    baseline_ft,
+    q_true_ft,
+    target_mean,
+    target_scale,
+):
+    """Match implied queue dynamics so true discharge is preserved."""
+    if not USE_SUPERVISED_DYNAMICS_LOSS:
+        return pred_scaled.new_tensor(0.0)
+
+    residual_pred_ft = pred_scaled * target_scale + target_mean
+    q_pred_ft = baseline_ft + residual_pred_ft
+    denom = float(QUEUE_CONSTRAINT_SCALE_FT)
+
+    if q_pred_ft.shape[1] < 2:
+        dq_loss = q_pred_ft.new_tensor(0.0)
+    else:
+        dq_pred = q_pred_ft[:, 1:] - q_pred_ft[:, :-1]
+        dq_true = q_true_ft[:, 1:] - q_true_ft[:, :-1]
+        dq_loss = torch.mean(((dq_pred - dq_true) / denom) ** 2)
+
+    if q_pred_ft.shape[1] < 3:
+        d2q_loss = q_pred_ft.new_tensor(0.0)
+    else:
+        d2q_pred = q_pred_ft[:, 2:] - 2.0 * q_pred_ft[:, 1:-1] + q_pred_ft[:, :-2]
+        d2q_true = q_true_ft[:, 2:] - 2.0 * q_true_ft[:, 1:-1] + q_true_ft[:, :-2]
+        d2q_loss = torch.mean(((d2q_pred - d2q_true) / denom) ** 2)
+
+    return LAMBDA_DQ_MATCH * dq_loss + LAMBDA_D2Q_MATCH * d2q_loss
+
+
+def supervised_queue_shape_loss(
+    pred_scaled,
+    baseline_ft,
+    q_true_ft,
+    target_mean,
+    target_scale,
+):
+    """Match coarse implied queue shape without post-hoc smoothing."""
+    if not USE_SUPERVISED_DYNAMICS_LOSS:
+        return pred_scaled.new_tensor(0.0)
+
+    residual_pred_ft = pred_scaled * target_scale + target_mean
+    q_pred_ft = baseline_ft + residual_pred_ft
+    denom = float(QUEUE_CONSTRAINT_SCALE_FT)
+
+    pred_peak = torch.amax(q_pred_ft, dim=1)
+    true_peak = torch.amax(q_true_ft, dim=1)
+    peak_loss = torch.mean(((pred_peak - true_peak) / denom) ** 2)
+
+    pred_mean = torch.mean(q_pred_ft, dim=1)
+    true_mean = torch.mean(q_true_ft, dim=1)
+    mean_loss = torch.mean(((pred_mean - true_mean) / denom) ** 2)
+
+    near_zero_mask = q_true_ft <= float(ZERO_QUEUE_TOL_FT)
+    if torch.any(near_zero_mask):
+        false_queue = torch.relu(q_pred_ft[near_zero_mask] - float(ZERO_QUEUE_TOL_FT))
+        zero_loss = torch.mean((false_queue / denom) ** 2)
+    else:
+        zero_loss = q_pred_ft.new_tensor(0.0)
+
+    return (
+        LAMBDA_WINDOW_PEAK_MATCH * peak_loss
+        + LAMBDA_WINDOW_MEAN_MATCH * mean_loss
+        + LAMBDA_ZERO_QUEUE_MATCH * zero_loss
+    )
+
+
+def residual_correction_smoothness_loss(
+    pred_scaled,
+    target_mean,
+    target_scale,
+):
+    """
+    Encourage the residual correction to be low-frequency.
+
+    The cumulative-count representation already carries the main queue
+    rise/dissipation pattern. The learned residual should correct systematic
+    bias, not create rapid local reversals in the reconstructed queue.
+    """
+    residual_pred_ft = pred_scaled * target_scale + target_mean
+    denom = float(RESIDUAL_CONSTRAINT_SCALE_FT)
+
+    if residual_pred_ft.shape[1] < 2:
+        dq_loss = residual_pred_ft.new_tensor(0.0)
+    else:
+        dq = residual_pred_ft[:, 1:] - residual_pred_ft[:, :-1]
+        dq_loss = torch.mean((dq / denom) ** 2)
+
+    if residual_pred_ft.shape[1] < 3:
+        d2q_loss = residual_pred_ft.new_tensor(0.0)
+    else:
+        d2q = residual_pred_ft[:, 2:] - 2.0 * residual_pred_ft[:, 1:-1] + residual_pred_ft[:, :-2]
+        d2q_loss = torch.mean((d2q / denom) ** 2)
+
+    return LAMBDA_RESIDUAL_DQ * dq_loss + LAMBDA_RESIDUAL_D2Q * d2q_loss
+
+
 def train_rnn_model(
     df: pd.DataFrame,
     feature_matrix_unscaled: np.ndarray,
@@ -675,12 +794,14 @@ def train_rnn_model(
     scaler_y.fit(y[train_mask].reshape(-1, 1))
     y_all_scaled = scaler_y.transform(y.reshape(-1, 1)).ravel()
     baseline_all_ft = df[BASELINE_COL].to_numpy(dtype=float)
+    q_true_all_ft = df[GT_COL].to_numpy(dtype=float)
 
     train_windows = build_windows(
         df=df,
         feature_matrix=X_all_scaled,
         y_scaled=y_all_scaled,
         baseline_ft=baseline_all_ft,
+        q_true_ft=q_true_all_ft,
         run_ids=MODEL_TRAIN_RUN_IDS,
         sequence_len=NN_SEQUENCE_LEN,
         stride=NN_SEQUENCE_STRIDE,
@@ -691,6 +812,7 @@ def train_rnn_model(
         feature_matrix=X_all_scaled,
         y_scaled=y_all_scaled,
         baseline_ft=baseline_all_ft,
+        q_true_ft=q_true_all_ft,
         run_ids=MODEL_VALIDATION_RUN_IDS,
         sequence_len=NN_SEQUENCE_LEN,
         stride=NN_SEQUENCE_STRIDE,
@@ -738,10 +860,11 @@ def train_rnn_model(
         model.train()
         train_losses = []
 
-        for xb, yb, baseb in train_loader:
+        for xb, yb, baseb, qtrueb in train_loader:
             xb = xb.to(DEVICE)
             yb = yb.to(DEVICE)
             baseb = baseb.to(DEVICE)
+            qtrueb = qtrueb.to(DEVICE)
 
             optimizer.zero_grad(set_to_none=True)
             pred = model(xb)
@@ -752,7 +875,10 @@ def train_rnn_model(
                 target_mean,
                 target_scale,
             )
-            loss = mse_loss + constraint_loss
+            dynamics_loss = supervised_queue_dynamics_loss(pred, baseb, qtrueb, target_mean, target_scale)
+            shape_loss = supervised_queue_shape_loss(pred, baseb, qtrueb, target_mean, target_scale)
+            residual_smoothness_loss = residual_correction_smoothness_loss(pred, target_mean, target_scale)
+            loss = mse_loss + constraint_loss + dynamics_loss + shape_loss + residual_smoothness_loss
             loss.backward()
 
             if NN_GRAD_CLIP_NORM is not None:
@@ -769,10 +895,11 @@ def train_rnn_model(
             val_losses = []
 
             with torch.no_grad():
-                for xb, yb, baseb in val_loader:
+                for xb, yb, baseb, qtrueb in val_loader:
                     xb = xb.to(DEVICE)
                     yb = yb.to(DEVICE)
                     baseb = baseb.to(DEVICE)
+                    qtrueb = qtrueb.to(DEVICE)
                     pred = model(xb)
                     mse_loss = loss_fn(pred, yb)
                     constraint_loss = physical_queue_constraint_loss(
@@ -781,7 +908,10 @@ def train_rnn_model(
                         target_mean,
                         target_scale,
                     )
-                    loss = mse_loss + constraint_loss
+                    dynamics_loss = supervised_queue_dynamics_loss(pred, baseb, qtrueb, target_mean, target_scale)
+                    shape_loss = supervised_queue_shape_loss(pred, baseb, qtrueb, target_mean, target_scale)
+                    residual_smoothness_loss = residual_correction_smoothness_loss(pred, target_mean, target_scale)
+                    loss = mse_loss + constraint_loss + dynamics_loss + shape_loss + residual_smoothness_loss
                     val_losses.append(float(loss.item()))
 
             val_loss = float(np.mean(val_losses)) if val_losses else np.nan
